@@ -8,11 +8,15 @@ without ever inventing a fact it wasn't given.
 **Live bot:** https://vera-bot-585x.onrender.com
 **Health check:** https://vera-bot-585x.onrender.com/v1/healthz
 
-> ⚠️ **Free-tier hosting note.** Render's free tier spins down after ~15
-> minutes of inactivity. The first request after idle may take 30–50s to
-> wake the instance, and **in-memory context does not survive a
-> spin-down**. Re-run `scripts/push_context.py` against the live URL before
-> any evaluation window if the instance may have gone idle.
+> ⚠️ **Free-tier hosting note.** The live bot is hosted on Render's Free
+> web-service tier. Free services can spin down after 15 minutes without
+> inbound traffic and may take about a minute to wake up. This bot stores
+> `/v1/context` data in memory, so a restart/spin-down clears the loaded
+> context. Before an evaluation window, re-run:
+>
+> ```bash
+> python scripts/push_context.py --bot-url https://vera-bot-585x.onrender.com --data expanded
+> ```
 
 ---
 
@@ -390,7 +394,6 @@ coverage across all **27 trigger kinds** represented in the dataset.
 ```bash
 python -m pytest tests/ -v
 
----
 ```
 
 ## Team
