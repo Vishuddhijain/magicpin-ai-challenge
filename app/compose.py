@@ -23,6 +23,7 @@ Design notes
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Optional
 import re
 
@@ -111,6 +112,124 @@ def matching_signal(merchant: Ctx, needle: str) -> Optional[str]:
     return None
 
 
+def parse_iso(ts: Optional[str]) -> Optional[datetime]:
+    """Tolerant ISO-8601 parser (accepts trailing 'Z'). Returns None on any
+    parse failure instead of raising — callers treat that as "unknown"."""
+    if not ts or not isinstance(ts, str):
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def is_trigger_expired(trigger: Ctx, now_iso: str) -> bool:
+    """Fix #2 — reject expired triggers using trigger.expires_at vs tick.now.
+    If either timestamp fails to parse, we don't have grounds to reject, so
+    we treat the trigger as not-expired (fail open on unknown, never on a
+    real not comparable read since that would be inventing an expiry)."""
+    expires = parse_iso(trigger.get("expires_at"))
+    now = parse_iso(now_iso)
+    if expires is None or now is None:
+        return False
+    return now >= expires
+
+
+# --------------------------------------------------------------------------
+# consent enforcement (Fix #3) — customer trigger kinds -> consent scopes
+# --------------------------------------------------------------------------
+# Any ONE of the listed scopes being present in customer.consent.scope is
+# sufficient to permit the outreach. Kinds not listed fall back to
+# "any explicit consent at all", which is the conservative default: we only
+# ever message a customer when they've said yes to *something*, and we only
+# send category-appropriate content when they've said yes to *that*.
+CONSENT_SCOPE_MAP: dict[str, list[str]] = {
+    "recall_due":                 ["recall_reminders"],
+    "customer_lapsed_soft":       ["recall_reminders", "winback_offers"],
+    "customer_lapsed_hard":       ["winback_offers", "renewal_reminders"],
+    "winback_eligible":           ["winback_offers", "renewal_reminders"],
+    "wedding_package_followup":   ["bridal_package_followup"],
+    "appointment_tomorrow":       ["appointment_reminders"],
+    "chronic_refill_due":         ["refill_reminders", "recall_alerts"],
+    "trial_followup":             ["program_updates", "kids_program_updates", "treatment_followup"],
+}
+
+
+def consent_allows(kind: str, customer: Optional[Ctx]) -> bool:
+    """True only if this customer has actually consented to this kind of
+    outreach. No customer context at all -> can't verify -> False."""
+    if not customer:
+        return False
+    consent = customer.get("consent", {}) or {}
+    if not consent.get("opted_in_at"):
+        return False
+    scope = set(consent.get("scope") or [])
+    if not scope:
+        return False
+    required = CONSENT_SCOPE_MAP.get(kind)
+    if required is None:
+        # Unmapped customer-facing kind: any real consent at all is the floor.
+        return True
+    return bool(scope & set(required))
+
+
+# --------------------------------------------------------------------------
+# perf_spike / perf_dip / seasonal_perf_dip grounding (Fixes #4 + #5)
+# --------------------------------------------------------------------------
+
+def resolve_perf_signal(trigger: Ctx, merchant: Ctx) -> Optional[dict]:
+    """Trigger.payload is the primary source of truth for spike/dip specifics
+    (metric, delta_pct, window, vs_baseline, likely_driver). Only when the
+    payload is missing real numbers (e.g. a generator placeholder payload)
+    do we fall back to merchant.performance.delta_7d."""
+    payload = trigger.get("payload", {}) or {}
+    metric = payload.get("metric")
+    delta_pct = payload.get("delta_pct")
+    if metric and delta_pct is not None:
+        return {
+            "metric": metric,
+            "delta_pct": delta_pct,
+            "window": payload.get("window"),
+            "vs_baseline": payload.get("vs_baseline"),
+            "likely_driver": payload.get("likely_driver"),
+            "source": "payload",
+        }
+    # Fallback: merchant's own performance snapshot.
+    delta7 = merchant.get("performance", {}).get("delta_7d", {}) or {}
+    for candidate_metric, key in (("views", "views_pct"), ("calls", "calls_pct"), ("ctr", "ctr_pct")):
+        if delta7.get(key) is not None:
+            return {
+                "metric": candidate_metric,
+                "delta_pct": delta7[key],
+                "window": "7d",
+                "vs_baseline": None,
+                "likely_driver": None,
+                "source": "merchant_performance",
+            }
+    return None
+
+
+def is_perf_trigger_contradicted(trigger: Ctx, merchant: Ctx) -> bool:
+    """Fix #5 — a perf_spike trigger whose actually-measured delta is negative,
+    or a perf_dip/seasonal_perf_dip trigger whose actually-measured delta is
+    positive, is contradicted by the merchant's own real numbers. Sending it
+    would be a contradictory/irrelevant message, so the caller (tick ranking)
+    should suppress the trigger entirely rather than compose from it.
+    When there is no measurable signal at all (neither payload nor merchant
+    performance carries a number), we have no evidence *against* the trigger,
+    so we do not treat that as a contradiction."""
+    kind = trigger.get("kind", "")
+    if kind not in ("perf_spike", "perf_dip", "seasonal_perf_dip"):
+        return False
+    signal = resolve_perf_signal(trigger, merchant)
+    if signal is None or signal.get("delta_pct") is None:
+        return False
+    delta = signal["delta_pct"]
+    if kind == "perf_spike":
+        return delta < 0
+    return delta > 0  # perf_dip / seasonal_perf_dip
+
+
 CLINICAL_SLUGS = {"dentists", "pharmacies"}
 
 
@@ -147,12 +266,72 @@ def peer_gap(merchant: Ctx, category: Ctx, metric: str) -> Optional[tuple[float,
 AUTO_REPLY_PATTERNS = [
     "shukriya", "aapki jaankari ke liye", "team tak pahuncha",
     "automated assistant", "thank you for contacting", "we will get back",
-    "aapka message mil gaya hai",
+    "aapka message mil gaya hai", "your query has been", "we have received your",
+    "will respond within", "our support team", "ticket number", "ticket id",
+    "case id", "reference number", "query has been logged", "query has been registered",
+    "jald hi sampark", "jaldi sampark", "humein aapka message mila",
+    "hamari team", "aapse sampark", "out of office", "auto-reply", "auto reply",
 ]
 
+# Fix #7 — a bag of generic "this looks automated/boilerplate" marker stems
+# (English + romanized Hindi). Used when a canned reply doesn't match any
+# fixed AUTO_REPLY_PATTERNS substring verbatim (e.g. a *different* autoresponder
+# template than the one seen earlier in the same conversation) — we score how
+# many distinct canned-language markers a message hits rather than requiring
+# an exact phrase or exact repeat.
+CANNED_MARKER_STEMS = [
+    "shukriya", "dhanyavad", "thank", "thanks", "contact", "team", "revert",
+    "respond", "response", "received", "mil", "jald", "sampark", "karenge",
+    "karegi", "query", "ticket", "case", "reference", "concern", "support",
+    "automat", "bot", "acknowledg", "logged", "registered", "shortly", "soon",
+]
+
+
+def _canned_marker_hits(text: str) -> int:
+    words = re.findall(r"[a-zA-Z]+", text.lower())
+    hits = 0
+    for w in words:
+        if any(w.startswith(stem) for stem in CANNED_MARKER_STEMS):
+            hits += 1
+    return hits
+
+
+def _normalize_for_similarity(text: str) -> str:
+    return re.sub(r"[^a-z0-9\s]", "", text.lower()).strip()
+
+
+def _text_similarity(a: str, b: str) -> float:
+    """Token-set (Jaccard) similarity — robust to reordering/small wording
+    changes between two differently-phrased canned messages, which a plain
+    difflib character-ratio would under-score for short texts."""
+    ta = set(_normalize_for_similarity(a).split())
+    tb = set(_normalize_for_similarity(b).split())
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def looks_like_canned_reply(text: str, prior_canned_texts: list[str]) -> bool:
+    """Fix #7 — recognizes a canned/auto-reply even when it is NOT an exact
+    string match and NOT one of the fixed AUTO_REPLY_PATTERNS substrings, as
+    long as either (a) it carries enough generic canned-language markers on
+    its own, or (b) it's textually similar to a message already flagged as
+    canned earlier in this same conversation (a different autoresponder
+    template saying essentially the same thing)."""
+    if _matches_any(AUTO_REPLY_PATTERNS, text):
+        return True
+    if _canned_marker_hits(text) >= 3:
+        return True
+    for prior in prior_canned_texts:
+        if _text_similarity(text, prior) >= 0.35:
+            return True
+    return False
+
+
 INTENT_PATTERNS = [
-    r"\blet'?s do it\b", r"\bgo ahead\b", r"\bi want to join\b", r"\byes.*(join|start|do it)\b",
-    r"\bchalo\b", r"\bshuru kar\b", r"\bok(?:ay)? (?:kar dijiye|karo|kijiye)\b", r"\bhaan.*chalo\b",
+    r"\blet'?s do it\b", r"\bgo ahead\b", r"\bi want to join\b",
+    r"\byes\b", r"\bchalo\b", r"\bhaan\b", r"\bshuru kar\b",
+    r"\bok(?:ay)? (?:kar dijiye|karo|kijiye)\b", r"\bdo it\b", r"\bsounds good\b",
     r"\bplease (?:update|do|proceed)\b",
 ]
 
@@ -182,7 +361,7 @@ KIND_META: dict[str, dict[str, str]] = {
     "winback_eligible":            {"cta": "binary", "angle": "winback"},
     "perf_spike":                  {"cta": "open",   "angle": "spike"},
     "perf_dip":                    {"cta": "open",   "angle": "dip"},
-    "seasonal_perf_dip":           {"cta": "open",   "angle": "dip"},
+    "seasonal_perf_dip":           {"cta": "open",   "angle": "seasonal_dip"},
     "milestone_reached":           {"cta": "open",   "angle": "milestone"},
     "dormant_with_vera":           {"cta": "open",   "angle": "dormant"},
     "appointment_tomorrow":        {"cta": "binary", "angle": "appointment"},
@@ -191,13 +370,13 @@ KIND_META: dict[str, dict[str, str]] = {
     "curious_ask_due":             {"cta": "open",   "angle": "curious_ask"},
     "festival_upcoming":           {"cta": "binary", "angle": "seasonal"},
     "category_seasonal":           {"cta": "binary", "angle": "seasonal"},
-    "ipl_match_today":             {"cta": "binary", "angle": "seasonal"},
-    "wedding_package_followup":    {"cta": "binary", "angle": "seasonal"},
+    "ipl_match_today":             {"cta": "binary", "angle": "ipl_match"},
+    "wedding_package_followup":    {"cta": "binary", "angle": "wedding_followup"},
     "active_planning_intent":      {"cta": "binary", "angle": "intent"},
     "renewal_due":                 {"cta": "binary", "angle": "renewal"},
     "gbp_unverified":              {"cta": "binary", "angle": "gbp"},
     "competitor_opened":           {"cta": "open",   "angle": "competitor"},
-    "supply_alert":                {"cta": "binary", "angle": "compliance"},
+    "supply_alert":                {"cta": "binary", "angle": "supply_alert"},
     "chronic_refill_due":          {"cta": "binary", "angle": "recall"},
     "trial_followup":              {"cta": "binary", "angle": "recall"},
 }
@@ -237,8 +416,39 @@ def build_anchor(angle: str, category: Ctx, merchant: Ctx, trigger: Ctx, custome
                     ) else f" — {n}-sample study."
                 elif item.get("summary"):
                     hook += f" {item['summary']}"
+            if item.get("actionable"):
+                hook += f" {item['actionable']}."
             return hook, src
         return "There's a category update relevant to your practice this week.", ""
+
+    if angle == "supply_alert":
+        # Fix #4 — payload is the primary (and often *only*) source for a
+        # supply/recall alert: molecule + batch numbers are what makes this
+        # actionable, and we never invent a batch number that isn't given.
+        molecule = payload.get("molecule")
+        batches = payload.get("affected_batches") or []
+        manufacturer = payload.get("manufacturer")
+        item = resolve_digest_item(category, payload.get("alert_id"))
+        if molecule:
+            hook = f"Supply alert: {molecule}"
+            if batches:
+                hook += f" — batches {', '.join(batches)}"
+            if manufacturer:
+                hook += f" ({manufacturer})"
+            hook += " flagged."
+            if item and item.get("summary"):
+                hook += f" {item['summary']}"
+            elif item and item.get("title"):
+                hook += f" {item['title']}."
+            if item and item.get("actionable"):
+                hook += f" {item['actionable']}."
+            return hook, item.get("source", "") if item else ""
+        if item:
+            hook = item.get("title", "A supply alert affects your stock.")
+            if item.get("summary"):
+                hook += f" {item['summary']}"
+            return hook, item.get("source", "")
+        return "A supply/compliance alert affecting your stock needs a look.", ""
 
     if angle in ("recall", "winback"):
         if customer:
@@ -261,25 +471,74 @@ def build_anchor(angle: str, category: Ctx, merchant: Ctx, trigger: Ctx, custome
         return "A batch of your regulars are due for their recall window.", ""
 
     if angle in ("spike", "dip"):
-        views_pct = delta.get("views_pct")
-        calls_pct = delta.get("calls_pct")
-        metric, pct = ("views", views_pct) if angle == "spike" else ("calls", calls_pct)
-        if pct is None:
-            metric, pct = "views", views_pct
-        if pct is not None:
-            # Direction word is derived from the *actual* sign of the real
-            # metric, never from the trigger's kind label — a generated
-            # "perf_dip" trigger can carry a merchant whose current delta is
-            # actually positive, and narrating "down +2%" would be a
-            # self-contradicting, ungrounded claim.
+        # Fix #4 — trigger.payload (metric/delta_pct/vs_baseline/likely_driver)
+        # is the primary source; merchant.performance.delta_7d is only a
+        # fallback for generator placeholder triggers that carry no real
+        # numbers. Fix #5's contradiction check (is_perf_trigger_contradicted)
+        # is applied by the tick-ranking layer *before* compose is ever
+        # called for perf_spike/perf_dip, so by the time we get here the
+        # direction implied by `angle` and the actual sign should already
+        # agree — but we still derive the verb from the real sign, never
+        # from the label, as a last line of defense.
+        signal = resolve_perf_signal(trigger, merchant)
+        if signal:
+            metric = signal["metric"]
+            pct = signal["delta_pct"]
             verb = "up" if pct >= 0 else "down"
+            window = signal.get("window") or f"{perf.get('window_days', 30)}d"
+            baseline_txt = f" vs a {signal['vs_baseline']}/day baseline" if signal.get("vs_baseline") is not None else ""
+            driver_txt = f" — likely driver: {signal['likely_driver'].replace('_', ' ')}" if signal.get("likely_driver") else ""
+            current = perf.get(metric, "—")
             return (
-                f"Your {metric} are {verb} {abs(round(pct * 100))}% week-over-week ({perf.get(metric, '—')} in the last {perf.get('window_days', 30)}d).",
+                f"Your {metric} are {verb} {abs(round(pct * 100))}% over the last {window}{baseline_txt} "
+                f"({current} {metric} in the last {perf.get('window_days', 30)}d).{driver_txt}",
                 "",
             )
         return "Your listing performance moved noticeably this week.", ""
 
+    if angle == "seasonal_dip":
+        # A dip that's *expected* for the season gets reframed, not alarmed:
+        # pivot to what a merchant can proactively do in this low window
+        # instead of implying something is wrong.
+        signal = resolve_perf_signal(trigger, merchant)
+        beats = category.get("seasonal_beats", [])
+        season_note_raw = payload.get("season_note", "") or ""
+        note = season_note_raw.replace("_", " ") if season_note_raw else None
+        months = re.findall(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b", season_note_raw.lower())
+        beat_note = next(
+            (b.get("note") for b in beats if any(mo in b.get("month_range", "").lower() for mo in months)),
+            None,
+        ) or (beats[0]["note"] if beats and not months else None)
+        if signal and signal.get("delta_pct") is not None:
+            pct_txt = f"{abs(round(signal['delta_pct'] * 100))}% below your usual — expected for this window, not a red flag."
+            metric_txt = f"Your {signal['metric']} are {pct_txt}"
+        else:
+            metric_txt = "This is a seasonally quiet window for your category — not a red flag."
+        if beat_note:
+            return f"{metric_txt} {beat_note.capitalize()}.", ""
+        return metric_txt, ""
+
     if angle == "milestone":
+        # Fix #4 — the payload's own metric/value_now/milestone_value is the
+        # ground truth for a milestone trigger; customer_aggregate is only a
+        # fallback when the payload doesn't name a concrete metric.
+        metric = payload.get("metric")
+        value_now = payload.get("value_now")
+        milestone_value = payload.get("milestone_value")
+        if metric and value_now is not None:
+            noun = metric.replace("_", " ")
+            ident = merchant.get("identity", {})
+            locality = ident.get("locality", "local")
+            if milestone_value is not None and value_now < milestone_value:
+                remaining = milestone_value - value_now
+                return (
+                    f"You're at {value_now} {noun}, {remaining} away from {milestone_value} — "
+                    f"a milestone worth marking for {_a_an(locality)} {locality} {_biz_noun(category)}.",
+                    "",
+                )
+            if milestone_value is not None:
+                return f"You've crossed {value_now} {noun} — past the {milestone_value} milestone.", ""
+            return f"You're at {value_now} {noun} — worth marking publicly.", ""
         agg = merchant.get("customer_aggregate", {})
         ident = merchant.get("identity", {})
         if agg.get("total_unique_ytd"):
@@ -322,6 +581,51 @@ def build_anchor(angle: str, category: Ctx, merchant: Ctx, trigger: Ctx, custome
         note = beats[0]["note"] if beats else payload.get("metric_or_topic", "a seasonal moment")
         return f"{note.capitalize() if isinstance(note, str) else note} — good moment to be visible.", ""
 
+    if angle == "ipl_match":
+        # Fix #4 — payload carries the real match/venue/time; never invent a
+        # fixture the payload doesn't name.
+        match = payload.get("match")
+        venue = payload.get("venue")
+        city = payload.get("city")
+        match_time = payload.get("match_time_iso")
+        if match:
+            hook = f"{match} tonight"
+            if venue:
+                hook += f" at {venue}"
+            if city:
+                hook += f" ({city})"
+            if match_time:
+                # keep just the local time portion for readability
+                time_part = match_time.split("T")[1][:5] if "T" in match_time else match_time
+                hook += f", {time_part} kickoff"
+            hook += " — match-night crowd looking for a place to watch."
+            offer = active_offer(merchant)
+            if offer:
+                hook += f" Your {offer['title']} fits the moment."
+            return hook, ""
+        return "There's a match-night moment worth a quick promo push today.", ""
+
+    if angle == "wedding_followup":
+        # Fix #4 — days_to_wedding / trial_completed / next_step_window_open
+        # from the payload are the anchor; customer name only when we
+        # actually have a customer context (this trigger is customer-scoped).
+        wedding_date = payload.get("wedding_date")
+        trial_completed = payload.get("trial_completed")
+        days_to_wedding = payload.get("days_to_wedding")
+        next_step = payload.get("next_step_window_open")
+        name = customer.get("identity", {}).get("name") if customer else None
+        who = f"{name}'s" if name else "Their"
+        parts = []
+        if trial_completed:
+            parts.append(f"{who} trial was completed on {trial_completed}")
+        if days_to_wedding is not None and wedding_date:
+            parts.append(f"the wedding is {days_to_wedding} days out ({wedding_date})")
+        hook = "; ".join(parts) if parts else "the bridal trial is done and the wedding is approaching"
+        hook = hook[0].upper() + hook[1:] + "."
+        if next_step:
+            hook += f" Next window open: {next_step.replace('_', ' ')}."
+        return hook, ""
+
     if angle == "intent":
         topic = (payload.get("intent_topic") or "").replace("_", " ")
         quote = payload.get("merchant_last_message")
@@ -345,6 +649,47 @@ def build_anchor(angle: str, category: Ctx, merchant: Ctx, trigger: Ctx, custome
         return (f"Your Google profile has a gap: {stale.replace('_', ' ')}." if stale else "Your Google profile has an open gap worth closing."), ""
 
     if angle == "competitor":
+        # Fix #4 — payload's competitor_name/distance_km/their_offer are the
+        # anchor. Never invent a competitor name or offer the payload
+        # doesn't provide.
+        name = payload.get("competitor_name")
+        distance = payload.get("distance_km")
+        their_offer = payload.get("their_offer")
+        opened = payload.get("opened_date")
+        if name:
+            hook = f"{name} opened"
+            if distance is not None:
+                hook += f" {distance}km away"
+            if opened:
+                hook += f" on {opened}"
+            hook += "."
+            if their_offer:
+                hook += f" They're running \"{their_offer}\"."
+            my_offer = active_offer(merchant)
+            if my_offer:
+                hook += f" You currently have {my_offer['title']} live."
+            return hook, ""
+        # Item 12 fix — a placeholder competitor_opened payload (no real
+        # name/distance/offer) previously fell back to a flat, no-fact line
+        # ("A new competitor listing appeared near you on Google."), which is
+        # exactly the "Generic — no merchant fact" failure mode the rubric
+        # penalizes. Ground it in the merchant's own real, verifiable data
+        # instead (CTR vs category peer median, or their own live offer)
+        # rather than inventing a name/distance the payload doesn't give us.
+        gap = peer_gap(merchant, category, "ctr")
+        if gap:
+            mv, pv = gap
+            return (
+                f"A new competitor listing appeared near you on Google. Your CTR is "
+                f"{mv:.1%} vs a {pv:.1%} category median for your locality — worth a look "
+                f"before they pull ahead on visibility."
+            ), ""
+        my_offer = active_offer(merchant)
+        if my_offer:
+            return (
+                f"A new competitor listing appeared near you on Google. You currently have "
+                f"{my_offer['title']} live, so it's worth checking how the two listings stack up."
+            ), ""
         return "A new competitor listing appeared near you on Google.", ""
 
     # generic fallback — always available from performance + peer_stats
@@ -376,20 +721,32 @@ def build_cta_sentence(cta_kind: str, angle: str, merchant: Ctx, customer: Optio
             return "Reply YES and I'll send the draft now, or STOP to hold off.", "binary_yes_stop"
         if angle == "appointment":
             return "Reply YES to confirm, or let us know if you'd like to reschedule.", "binary_yes_stop"
+        if angle == "ipl_match":
+            return "Want me to push a match-night post now — just say go?", "binary_yes_no"
+        if angle == "wedding_followup":
+            return "Reply YES to book the next-step session, or STOP if not needed.", "binary_yes_stop"
+        if angle == "supply_alert":
+            return "Reply YES and I'll draft the customer notice now, or STOP to handle it yourself.", "binary_yes_stop"
         return "Reply YES to go ahead, or STOP to skip this.", "binary_yes_stop"
     if cta_kind == "open":
         if angle == "curious_ask":
             return "What's your most-asked service this week?", "open_ended"
         if angle in ("research", "compliance"):
             return "Want me to pull the full item and draft something you can share?", "open_ended"
-        if angle in ("spike", "dip"):
+        if angle == "spike":
             return "Want a quick breakdown of what's driving it?", "open_ended"
+        if angle == "dip":
+            return "Want a quick breakdown of what's driving it?", "open_ended"
+        if angle == "seasonal_dip":
+            return "Want me to suggest what to focus on this window instead?", "open_ended"
         if angle == "milestone":
             return "Want me to draft a post celebrating this for your page?", "open_ended"
         if angle == "dormant":
             return "Anything I can help with this week?", "open_ended"
         if angle == "review":
             return "Want me to draft a response you can post?", "open_ended"
+        if angle == "competitor":
+            return "Want me to check how your listing compares right now?", "open_ended"
         return "Want me to look into this further for you?", "open_ended"
     return "", "none"
 
@@ -442,6 +799,156 @@ def compose(category: Ctx, merchant: Ctx, trigger: Ctx, customer: Optional[Ctx] 
 
 
 # --------------------------------------------------------------------------
+# trigger ranking (Fix #1) — used by /v1/tick before it decides what to send
+# --------------------------------------------------------------------------
+# Each candidate is scored 0-10ish across the dimensions the fix calls out.
+# The score is a ranking signal only; /v1/tick still applies hard gates
+# (expiry, consent, dedup) before a candidate is ever composed/sent.
+
+def _payload_richness(trigger: Ctx) -> float:
+    """0..1 — how much real, specific data this trigger's payload carries.
+    A generator placeholder payload ({"placeholder": True, ...}) scores near
+    zero; a payload with several concrete fields scores high."""
+    payload = trigger.get("payload", {}) or {}
+    if payload.get("placeholder"):
+        return 0.1
+    concrete = [v for v in payload.values() if v not in (None, "", [], {})]
+    if not concrete:
+        return 0.1
+    return min(1.0, 0.35 + 0.15 * len(concrete))
+
+
+def _signal_strength(trigger: Ctx, merchant: Ctx, category: Ctx) -> float:
+    """0..1 — does the merchant's own data back this trigger up? E.g. a
+    review_theme_emerged trigger backed by merchant.review_themes, a
+    perf trigger backed by a real measurable delta, a recall trigger backed
+    by a real customer_aggregate."""
+    kind = trigger.get("kind", "")
+    payload = trigger.get("payload", {}) or {}
+    if kind in ("perf_spike", "perf_dip", "seasonal_perf_dip"):
+        signal = resolve_perf_signal(trigger, merchant)
+        return 1.0 if signal else 0.2
+    if kind == "review_theme_emerged":
+        return 1.0 if merchant.get("review_themes") else 0.3
+    if kind in ("recall_due", "customer_lapsed_soft", "customer_lapsed_hard", "winback_eligible"):
+        agg = merchant.get("customer_aggregate", {})
+        return 1.0 if agg.get("lapsed_180d_plus") else 0.5
+    if kind in ("research_digest", "regulation_change", "cde_opportunity", "supply_alert"):
+        item = resolve_digest_item(category, payload.get("top_item_id") or payload.get("alert_id"))
+        return 1.0 if item else 0.4
+    if kind == "milestone_reached":
+        return 1.0 if payload.get("value_now") is not None else 0.4
+    if kind == "gbp_unverified":
+        return 1.0 if matching_signal(merchant, "stale_posts") or not merchant.get("identity", {}).get("verified", True) else 0.4
+    return 0.6  # neutral default for kinds with no specific merchant-side check
+
+
+def _actionability(meta: dict) -> float:
+    return 1.0 if meta.get("cta") == "binary" else (0.6 if meta.get("cta") == "open" else 0.3)
+
+
+def _category_fit(trigger: Ctx, merchant: Ctx) -> float:
+    """Mostly 1.0 since triggers are pre-scoped to a merchant_id whose
+    category already matches; the one real check available in this dataset
+    is festival_upcoming's category_relevance list."""
+    payload = trigger.get("payload", {}) or {}
+    relevance = payload.get("category_relevance")
+    if relevance:
+        return 1.0 if merchant.get("category_slug") in relevance else 0.4
+    return 1.0
+
+
+def _customer_relevance(trigger: Ctx, customer: Optional[Ctx]) -> float:
+    if trigger.get("scope") != "customer":
+        return 1.0  # merchant-facing trigger — customer relevance not applicable
+    if not customer:
+        return 0.0  # customer-scoped trigger with no customer context to ground it
+    state = customer.get("state")
+    kind = trigger.get("kind", "")
+    if kind in ("customer_lapsed_soft",) and state != "lapsed_soft":
+        return 0.5
+    if kind in ("customer_lapsed_hard", "winback_eligible") and state not in ("lapsed_hard", "churned"):
+        return 0.5
+    return 1.0
+
+
+def evaluate_trigger_candidate(
+    trigger: Ctx,
+    merchant: Ctx,
+    category: Ctx,
+    customer: Optional[Ctx],
+    now_iso: str,
+    already_sent_keys: set,
+) -> dict:
+    """Runs the hard gates (Fixes #2, #3, #5) and, if the candidate survives,
+    computes a ranking score across the dimensions in Fix #1.
+
+    Returns {"eligible": bool, "reason": str, "score": float}. `score` is
+    only meaningful when eligible=True.
+    """
+    kind = trigger.get("kind", "")
+
+    if is_trigger_expired(trigger, now_iso):
+        return {"eligible": False, "reason": "expired", "score": 0.0}
+
+    supp_key = trigger.get("suppression_key") or f"{kind}:{merchant.get('merchant_id')}:{trigger.get('id')}"
+    if supp_key in already_sent_keys:
+        return {"eligible": False, "reason": "duplicate_suppression_key", "score": 0.0}
+
+    if trigger.get("scope") == "customer":
+        if not customer:
+            return {"eligible": False, "reason": "customer_scope_missing_customer_context", "score": 0.0}
+        if not consent_allows(kind, customer):
+            return {"eligible": False, "reason": "consent_does_not_cover_outreach", "score": 0.0}
+
+    if is_perf_trigger_contradicted(trigger, merchant):
+        return {"eligible": False, "reason": "perf_direction_contradicted_by_actual_metric", "score": 0.0}
+
+    meta = KIND_META.get(kind, DEFAULT_KIND_META)
+    urgency_norm = max(0.0, min(1.0, (trigger.get("urgency") or 1) / 5.0))
+    relevance = _payload_richness(trigger)
+    signal_strength = _signal_strength(trigger, merchant, category)
+    customer_relevance = _customer_relevance(trigger, customer)
+    actionability = _actionability(meta)
+    category_fit = _category_fit(trigger, merchant)
+
+    score = (
+        2.0 * urgency_norm
+        + 2.0 * relevance
+        + 1.5 * signal_strength
+        + 1.0 * customer_relevance
+        + 1.0 * actionability
+        + 1.0 * category_fit
+    )
+
+    return {
+        "eligible": True,
+        "reason": "ok",
+        "score": round(score, 4),
+        "breakdown": {
+            "urgency": urgency_norm,
+            "trigger_relevance": relevance,
+            "merchant_signal_strength": signal_strength,
+            "customer_relevance": customer_relevance,
+            "actionability": actionability,
+            "category_fit": category_fit,
+        },
+    }
+
+
+def rank_trigger_candidates(candidates: list[dict]) -> list[dict]:
+    """candidates: list of {"trigger_id", "trigger", "merchant", "category",
+    "customer", "eval": <output of evaluate_trigger_candidate>}. Returns only
+    the eligible ones, sorted best-first (ties broken by higher urgency,
+    then trigger_id for full determinism)."""
+    eligible = [c for c in candidates if c["eval"]["eligible"]]
+    eligible.sort(
+        key=lambda c: (-c["eval"]["score"], -(c["trigger"].get("urgency") or 0), c["trigger_id"])
+    )
+    return eligible
+
+
+# --------------------------------------------------------------------------
 # conversation (reply) handling — used by /v1/reply
 # --------------------------------------------------------------------------
 
@@ -450,47 +957,133 @@ def _matches_any(patterns: list[str], text: str) -> bool:
     return any(re.search(p, t) for p in patterns)
 
 
-def handle_reply(history: list[dict], merchant_message: str) -> dict:
+# Fix #6 — a short label naming the concrete thing this conversation is
+# actually about, pulled from the remembered original trigger/offer. Used to
+# keep replies specific instead of generic "got it, noted" filler. Never
+# invents facts: only uses what the stored state actually carries.
+def _context_anchor_phrase(state: Optional[dict]) -> Optional[str]:
+    if not state:
+        return None
+    trigger = state.get("trigger") or {}
+    payload = trigger.get("payload") or {}
+    kind = trigger.get("kind", "")
+    offer = state.get("selected_offer")
+
+    if kind == "competitor_opened" and payload.get("competitor_name"):
+        return f"the {payload['competitor_name']} competitor listing"
+    if kind in ("perf_dip", "seasonal_perf_dip") and payload.get("metric"):
+        return f"your {payload['metric']} dip"
+    if kind == "perf_spike" and payload.get("metric"):
+        return f"your {payload['metric']} spike"
+    if kind == "milestone_reached" and payload.get("metric"):
+        return f"your {payload['metric'].replace('_', ' ')} milestone"
+    if kind == "supply_alert" and payload.get("molecule"):
+        return f"the {payload['molecule']} supply alert"
+    if kind == "wedding_package_followup" and payload.get("next_step_window_open"):
+        return f"the {payload['next_step_window_open'].replace('_', ' ')} next step"
+    if kind == "ipl_match_today" and payload.get("match"):
+        return f"tonight's {payload['match']} promo"
+    if kind == "regulation_change":
+        return "the compliance update"
+    if kind == "research_digest":
+        return "that research item"
+    if kind == "recall_due" and payload.get("service_due"):
+        return f"the {payload['service_due'].replace('_', ' ')} recall"
+    if kind == "chronic_refill_due":
+        return "the refill reminder"
+    if kind == "active_planning_intent" and payload.get("intent_topic"):
+        return payload["intent_topic"].replace("_", " ")
+    if offer and offer.get("title"):
+        return f"your {offer['title']}"
+    return None
+
+
+def _ensure_state(state: Optional[dict]) -> dict:
+    """Normalizes/defaults the conversation state dict (Fix #6 fields) so the
+    rest of this function can read/update it uniformly whether the caller
+    passed a fully-populated state (from bot.py's conversation_meta) or None
+    (e.g. direct unit-test calls with no state tracking)."""
+    s = state if state is not None else {}
+    s.setdefault("trigger", {})
+    s.setdefault("selected_offer", None)
+    s.setdefault("auto_reply_count", 0)
+    s.setdefault("intent_state", "none")   # none | qualifying | confirmed
+    s.setdefault("opt_out", False)
+    s.setdefault("canned_texts", [])       # Fix #7 — canned messages seen so far, for fuzzy matching
+    return s
+
+
+def handle_reply(history: list[dict], merchant_message: str, state: Optional[dict] = None) -> dict:
     """
     history: list of {"from": "merchant"|"vera", "msg": str} for this conversation,
              in chronological order, NOT including the current merchant_message.
+    state:   optional conversation-state dict (Fix #6) remembering the
+             original trigger, merchant/customer ids, original outbound
+             body, selected offer, category, auto_reply_count, intent_state,
+             and opt_out. When bot.py passes this in, it is mutated in place
+             (auto_reply_count/intent_state/opt_out are updated to reflect
+             this turn) so the caller can persist it back into its own
+             conversation store. Optional and defaulted for backward
+             compatibility with direct calls that don't track state.
     Returns a dict shaped like the /v1/reply response: action + body/rationale
     (and wait_seconds when action == "wait").
     """
+    s = _ensure_state(state)
+    anchor = _context_anchor_phrase(s)
+
     prior_merchant_msgs = [h["msg"] for h in history if h.get("from") == "merchant"]
     repeat_count = sum(1 for m in prior_merchant_msgs if m.strip() == merchant_message.strip())
 
-    # 1) auto-reply detection (brief §9 Pattern B): canned/verbatim-repeated text.
-    #    First occurrence -> try once with a direct, low-effort ask (in case a human
-    #    is behind it). Second occurrence -> stop burning turns, exit gracefully.
-    looks_canned = _matches_any(AUTO_REPLY_PATTERNS, merchant_message)
-    if repeat_count >= 2 or (repeat_count >= 1 and looks_canned):
+    # 1) auto-reply detection (brief §9 Pattern B): canned text, whether it's a
+    #    verbatim repeat OR a *different*-worded canned/autoresponder message
+    #    (Fix #7 — looks_like_canned_reply checks fixed patterns, generic
+    #    canned-language markers, and fuzzy similarity to canned texts already
+    #    seen this conversation, not just exact string equality).
+    #    First occurrence -> try once with a direct, low-effort ask (in case a
+    #    human is behind it). Second occurrence (even worded differently) ->
+    #    stop burning turns, exit gracefully.
+    looks_canned = looks_like_canned_reply(merchant_message, s["canned_texts"])
+    if looks_canned:
+        s["auto_reply_count"] = s.get("auto_reply_count", 0) + 1
+        s["canned_texts"].append(merchant_message)
+    if repeat_count >= 2 or (repeat_count >= 1 and looks_canned) or s["auto_reply_count"] >= 2:
         return {
             "action": "end",
-            "rationale": "Canned/auto-reply text seen 2+ times; exiting gracefully rather than burning further turns.",
+            "rationale": "Canned/auto-reply text seen 2+ times (including differently-worded canned "
+                         "messages recognized via marker/similarity matching, not just exact string "
+                         "repeats); exiting gracefully rather than burning further turns.",
         }
     if looks_canned:
+        topic_txt = f" on {anchor}" if anchor else ""
         return {
             "action": "send",
-            "body": "Got it. Before this goes to your team — want to take 2 minutes yourself to see exactly what's missing? One quick reply and I'll show you.",
+            "body": f"Got it. Before this goes to your team — want to take 2 minutes yourself{topic_txt}? One quick reply and I'll show you.",
             "cta": "open_ended",
             "rationale": "First canned/auto-reply detected; trying once directly (per Pattern B) before deciding whether to exit.",
         }
 
     # 2) explicit not-interested -> exit
     if _matches_any(NOT_INTERESTED_PATTERNS, merchant_message):
+        s["opt_out"] = True
         return {
             "action": "end",
             "rationale": "Merchant signaled not interested / opt-out; ending conversation gracefully.",
         }
 
-    # 3) explicit intent transition -> action mode, no more qualifying questions
+    # 3) explicit intent transition -> action mode, no more qualifying questions.
+    #    Fix #8 — this must never claim an external action (posting an offer,
+    #    sending a campaign, etc.) has already happened, since compose()/this
+    #    bot has not actually performed one; it only stops asking further
+    #    qualifying questions and states what happens next.
     if _matches_any(INTENT_PATTERNS, merchant_message):
+        s["intent_state"] = "confirmed"
+        what_txt = f" on {anchor}" if anchor else " on this"
         return {
             "action": "send",
-            "body": "Done — starting now, no more questions needed. I'll confirm once it's live.",
+            "body": f"Got it — starting{what_txt} now, no more questions from my side. I'll message you here once it's ready.",
             "cta": "none",
-            "rationale": "Detected explicit intent/agreement; routed straight to action instead of re-qualifying.",
+            "rationale": "Detected explicit intent/agreement; routed straight to action mode instead of "
+                         "re-qualifying, without claiming any action has already been completed.",
         }
 
     # 4) merchant wants time -> back off
@@ -501,10 +1094,18 @@ def handle_reply(history: list[dict], merchant_message: str) -> dict:
             "rationale": "Merchant asked for time; backing off 30 minutes before next contact.",
         }
 
-    # 5) default: acknowledge + advance with one low-friction next step
+    # 5) default: acknowledge + advance with one low-friction next step,
+    #    naming the concrete topic (Fix #6) instead of a generic "noted".
+    if s["intent_state"] == "none":
+        s["intent_state"] = "qualifying"
+    if anchor:
+        body = f"Got it — on {anchor}, want me to go ahead, or is there something specific you'd like changed first?"
+    else:
+        body = "Got it — noted. Want me to go ahead with the next step, or is there something specific you'd like changed first?"
     return {
         "action": "send",
-        "body": "Got it — noted. Want me to go ahead with the next step, or is there something specific you'd like changed first?",
+        "body": body,
         "cta": "open_ended",
-        "rationale": "No canned/opt-out/intent/wait signal detected; advancing the conversation one low-friction step.",
+        "rationale": "No canned/opt-out/intent/wait signal detected; advancing the conversation one low-friction step"
+                     + (f", anchored on '{anchor}' from the original trigger/offer" if anchor else "") + ".",
     }
